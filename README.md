@@ -33,6 +33,7 @@
 
 
 **Карта проекта:**
+```
 ├─ README.md
 ├─ docker-compose.dev.yml
 ├─ .env.dev
@@ -86,3 +87,4 @@
       └─ types/
          ├─ file.ts
          └─ alert.ts
+```

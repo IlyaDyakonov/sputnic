@@ -1,102 +1,87 @@
 import mimetypes
 from pathlib import Path
+from typing import AsyncIterator
 from uuid import uuid4
 
-from fastapi import HTTPException, UploadFile, status
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.config import DB_URL, STORAGE_DIR
-from src.infrastructure.db.session import async_session_maker
-from src.infrastructure.repositories.alert_repo import AlertRepository
+from src.application.ports.file_storage import FileStorage
 from src.infrastructure.repositories.file_repo import FileRepository
-from src.infrastructure.storage.local_storage import delete_file_if_exists, resolve_file_path, save_file
-from src.models import Alert, StoredFile
+from src.models import StoredFile
 
 
-async def list_files() -> list[StoredFile]:
-    async with async_session_maker() as session:
-        return await FileRepository(session).list_files()
+class FileUseCaseError(Exception):
+    pass
 
 
-async def list_alerts() -> list[Alert]:
-    async with async_session_maker() as session:
-        return await AlertRepository(session).list_alerts()
+class FileNotFoundError(FileUseCaseError):
+    pass
 
 
-async def get_file(file_id: str) -> StoredFile:
-    async with async_session_maker() as session:
-        file_item = await FileRepository(session).get_by_id(file_id)
+class EmptyFileError(FileUseCaseError):
+    pass
+
+
+class StoredFileMissingError(FileUseCaseError):
+    pass
+
+
+class FileService:
+    def __init__(self, session: AsyncSession, storage: FileStorage):
+        self.repo = FileRepository(session)
+        self.storage = storage
+
+    async def list_files(self) -> list[StoredFile]:
+        return await self.repo.list_files()
+
+    async def get_file(self, file_id: str) -> StoredFile:
+        file_item = await self.repo.get_by_id(file_id)
         if not file_item:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found")
+            raise FileNotFoundError("File not found")
         return file_item
 
+    async def create_file(
+        self,
+        title: str,
+        original_name: str | None,
+        mime_type: str | None,
+        chunks: AsyncIterator[bytes],
+    ) -> StoredFile:
+        file_id = str(uuid4())
+        suffix = Path(original_name or "").suffix
+        stored_name = f"{file_id}{suffix}"
+        size = await self.storage.save_stream(stored_name=stored_name, chunks=chunks)
+        if size == 0:
+            await self.storage.delete_if_exists(stored_name)
+            raise EmptyFileError("File is empty")
 
-async def create_file(title: str, upload_file: UploadFile) -> StoredFile:
-    content = await upload_file.read()
-    if not content:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="File is empty")
+        file_item = StoredFile(
+            id=file_id,
+            title=title,
+            original_name=original_name or stored_name,
+            stored_name=stored_name,
+            mime_type=mime_type or mimetypes.guess_type(stored_name)[0] or "application/octet-stream",
+            size=size,
+            processing_status="uploaded",
+        )
+        try:
+            return await self.repo.create(file_item)
+        except Exception:
+            await self.storage.delete_if_exists(stored_name)
+            raise
 
-    file_id = str(uuid4())
-    suffix = Path(upload_file.filename or "").suffix
-    stored_name = f"{file_id}{suffix}"
-    save_file(stored_name=stored_name, content=content)
-
-    file_item = StoredFile(
-        id=file_id,
-        title=title,
-        original_name=upload_file.filename or stored_name,
-        stored_name=stored_name,
-        mime_type=upload_file.content_type or mimetypes.guess_type(stored_name)[0] or "application/octet-stream",
-        size=len(content),
-        processing_status="uploaded",
-    )
-    async with async_session_maker() as session:
-        return await FileRepository(session).create(file_item)
-
-
-async def update_file(file_id: str, title: str) -> StoredFile:
-    async with async_session_maker() as session:
-        repo = FileRepository(session)
-        file_item = await repo.get_by_id(file_id)
-        if not file_item:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found")
+    async def update_file(self, file_id: str, title: str) -> StoredFile:
+        file_item = await self.get_file(file_id)
         file_item.title = title
-        return await repo.update(file_item)
+        return await self.repo.update(file_item)
 
+    async def delete_file(self, file_id: str) -> None:
+        file_item = await self.get_file(file_id)
+        await self.storage.delete_if_exists(file_item.stored_name)
+        await self.repo.delete(file_item)
 
-async def delete_file(file_id: str) -> None:
-    async with async_session_maker() as session:
-        repo = FileRepository(session)
-        file_item = await repo.get_by_id(file_id)
-        if not file_item:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found")
-        delete_file_if_exists(file_item.stored_name)
-        await repo.delete(file_item)
-
-
-async def get_file_path(file_id: str) -> tuple[StoredFile, Path]:
-    file_item = await get_file(file_id)
-    stored_path = resolve_file_path(file_item.stored_name)
-    if not stored_path.exists():
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Stored file not found")
-    return file_item, stored_path
-
-
-async def create_alert(file_id: str, level: str, message: str) -> Alert:
-    alert = Alert(file_id=file_id, level=level, message=message)
-    async with async_session_maker() as session:
-        return await AlertRepository(session).create(alert)
-
-
-# Compatibility exports for step-by-step migration.
-__all__ = [
-    "DB_URL",
-    "STORAGE_DIR",
-    "create_alert",
-    "create_file",
-    "delete_file",
-    "get_file",
-    "get_file_path",
-    "list_alerts",
-    "list_files",
-    "update_file",
-]
+    async def get_file_path(self, file_id: str) -> tuple[StoredFile, Path]:
+        file_item = await self.get_file(file_id)
+        if not await self.storage.exists(file_item.stored_name):
+            raise StoredFileMissingError("Stored file not found")
+        return file_item, self.storage.resolve_path(file_item.stored_name)

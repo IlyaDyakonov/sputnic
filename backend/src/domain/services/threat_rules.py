@@ -1,9 +1,14 @@
 from pathlib import Path
+from typing import Protocol
 
-from src.models import StoredFile
+
+class FileScanTarget(Protocol):
+    original_name: str
+    mime_type: str
+    size: int
 
 
-def evaluate_threat_reasons(file_item: StoredFile) -> list[str]:
+def evaluate_threat_reasons(file_item: FileScanTarget) -> list[str]:
     # Keep current MVP rules unchanged while isolating business logic.
     reasons: list[str] = []
     extension = Path(file_item.original_name).suffix.lower()
